@@ -324,6 +324,63 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				logger.Info("no follower/replicas configured, skipping replication configuration", "Leaders.Count", leaderCount, "Leader.Size", leaderReplicas, "Follower.Replicas", followerReplicas)
 			}
 		}
+		// Excess gossip nodes (typically fail/noaddr orphans left by a pod that
+		// returned under a new node id) inflate CheckRedisNodeCount above the
+		// desired total and would otherwise strand reconcile in this branch
+		// forever — never reaching RejoinIsolatedNodes / ReattachMisplacedReplicas
+		// below. After a MEET, the live ex-leader sits as an empty master while
+		// the old id still counts; run the same isolated-node repairs here so
+		// reattach can demote it. Missing nodes (nc < desired) stay on the
+		// create/scale path above and are not treated as repair.
+		if nc > totalReplicas && totalReplicas > 1 {
+			rejoined, err := k8sutils.RejoinIsolatedNodes(ctx, r.K8sClient, instance)
+			if err != nil {
+				logger.Error(err, "failed to rejoin isolated nodes (over-count path)")
+			}
+			if rejoined > 0 {
+				monitoring.RedisClusterRejoinIsolatedAttempt.WithLabelValues(instance.Namespace, instance.Name).Add(float64(rejoined))
+				return intctrlutil.RequeueAfter(ctx, time.Second*15, "rejoined isolated nodes with excess gossip entries, rechecking")
+			}
+			reattached, err := k8sutils.ReattachMisplacedReplicas(ctx, r.K8sClient, instance)
+			if err != nil {
+				logger.Error(err, "failed to reattach misplaced replicas (over-count path)")
+			}
+			if reattached > 0 {
+				monitoring.RedisClusterReattachReplicaAttempt.WithLabelValues(instance.Namespace, instance.Name).Add(float64(reattached))
+				return intctrlutil.RequeueAfter(ctx, time.Second*15, "reattached misplaced replicas with excess gossip entries, rechecking")
+			}
+
+			// Orphan cleanup for a pod deleted and rejoined under a NEW node ID. The dead
+			// old ID lingers in CLUSTER NODES, so CheckRedisNodeCount reads above the
+			// desired total (nc > totalReplicas) and reconcile would otherwise loop in the
+			// outer create/scale branch forever, never reaching the steady-state repairs.
+			// Two artifacts must be handled, in order:
+			//   1. RejoinIsolatedNodes MEETs the live replacement back (it returns as an
+			//      empty master, since CLUSTER MEET cannot reclaim the dead old ID).
+			//   2. ReattachMisplacedReplicas demotes that empty master onto its shard's
+			//      current slot owner.
+			//   3. ForgetStaleNodes prunes the dead old ID — last, so reattach has already
+			//      moved the returning ex-master off it. Any follower that still pointed at
+			//      the old master was re-replicated onto the promoted master by failover
+			//      itself; in the brief gossip-lag window before that propagates, forget may
+			//      see "can't forget my master" for some pod that actually did switch to the new
+			//      master after failover, and it must treat it as skip-this-cycle, not a
+			//      failure (the next pass forgets the now-unreferenced orphan).
+			//
+			// If the pod never returns (orphan, no replacement), it fills the missing pod's
+			// slot in the count rather than inflating it: nc == totalReplicas, so this block
+			// is skipped. staleNodeIDs then refuses to forget it (no healthy hostname twin),
+			// and it correctly surfaces as an unhealthy node until the pod returns or an
+			// administrator intervenes — e.g. forcing a failover if the shard cannot promote
+			// on its own.
+			if forgotten, ferr := k8sutils.ForgetStaleNodes(ctx, r.K8sClient, instance); ferr != nil {
+				logger.Error(ferr, "failed to forget stale nodes")
+			} else if forgotten > 0 {
+				logger.Info("Forgot stale nodes from cluster", "Count", forgotten)
+				monitoring.RedisClusterForgetStaleNodeTotal.WithLabelValues(instance.Namespace, instance.Name).Add(float64(forgotten))
+				return intctrlutil.RequeueAfter(ctx, time.Second*10, "forgot stale nodes, rechecking node count")
+			}
+		}
 		return intctrlutil.RequeueAfter(ctx, time.Second*60, "Redis cluster count is not desired", "Current.Count", nc, "Desired.Count", totalReplicas)
 	}
 
@@ -391,6 +448,45 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		if repaired > 0 {
 			return intctrlutil.RequeueAfter(ctx, time.Second*15, "repaired stale replication, rechecking")
+		}
+	}
+
+	// Rejoin pods that have become isolated from the cluster (CLUSTER INFO
+	// reports cluster_known_nodes <= 1). After a pod is deleted and recreated it
+	// can come back seeing only itself — typically when it restarts before its
+	// peers are reachable or its nodes.conf was lost — and never rejoins on its
+	// own, which previously required a manual CLUSTER MEET. This is invisible to
+	// the gossip-based RepairDisconnectedNodes check when the live pod has been
+	// dropped from leader-0's view, so it probes each pod directly. Skipped for
+	// single-node clusters, where cluster_known_nodes == 1 is the normal state.
+	if totalReplicas > 1 {
+		rejoined, err := k8sutils.RejoinIsolatedNodes(ctx, r.K8sClient, instance)
+		if err != nil {
+			logger.Error(err, "failed to rejoin isolated nodes")
+		}
+		if rejoined > 0 {
+			monitoring.RedisClusterRejoinIsolatedAttempt.WithLabelValues(instance.Namespace, instance.Name).Add(float64(rejoined))
+			return intctrlutil.RequeueAfter(ctx, time.Second*15, "rejoined isolated nodes, rechecking")
+		}
+	}
+
+	// Reattach pods that are sitting as empty (slot-less) masters back into
+	// replicas of their shard's current slot owner. This catches the cases
+	// RejoinIsolatedNodes leaves behind: a follower whose re-replication
+	// handshake didn't complete (lingering empty master) and an ex-leader that
+	// returned as an empty master after a failover (split shard). It runs before
+	// the empty-master rebalance below so a misplaced empty master is demoted to
+	// a replica instead of being rebalanced into a standalone slot owner; a
+	// genuinely new/empty shard (real scale-up, no live slot owner) is skipped
+	// and still falls through to the rebalance.
+	if totalReplicas > 1 {
+		reattached, err := k8sutils.ReattachMisplacedReplicas(ctx, r.K8sClient, instance)
+		if err != nil {
+			logger.Error(err, "failed to reattach misplaced replicas")
+		}
+		if reattached > 0 {
+			monitoring.RedisClusterReattachReplicaAttempt.WithLabelValues(instance.Namespace, instance.Name).Add(float64(reattached))
+			return intctrlutil.RequeueAfter(ctx, time.Second*15, "reattached misplaced replicas, rechecking")
 		}
 	}
 
